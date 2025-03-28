@@ -1,0 +1,1195 @@
+-----------------------------------------------------------------------------------
+-- //////////////////////// SERVER-SIDE SCRIPTS ////////////////////////
+-----------------------------------------------------------------------------------
+
+--// ServerScriptService: ServerGameManager //--
+local DataStoreService = game:GetService("DataStoreService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local ItemDefinitions = require(ReplicatedStorage.SharedModules:WaitForChild("ItemDefinitions"))
+local QuestDefinitions = require(ReplicatedStorage.SharedModules:WaitForChild("QuestDefinitions"))
+
+local playerDataStore = DataStoreService:GetDataStore("AdventureGameDataV3")
+local guildDataStore = DataStoreService:GetDataStore("GuildDataV3")
+
+-- Configuration (More Extensive - Including Scalability Options)
+local LEVEL_CAP = 150
+local STARTING_LEVEL = 1
+local EXPERIENCE_MULTIPLIER = 1.25
+local CURRENCY_NAME = "Gold"
+local STARTING_CURRENCY = 500
+local GUILD_TAG_LENGTH_LIMIT = 8
+local ADMIN_USER_IDS = {} -- Add admin UserIds here
+local DEVELOPER_USER_IDS = {} -- Add developer UserIds here
+local CRAFTING_STATION_TAG = "CraftingStation"
+local TRADING_DISTANCE = 15
+
+-- Scalability Configuration
+local USE_EXTERNAL_DATABASE = true -- Set to true to use the conceptual external database saving
+local EXTERNAL_API_ENDPOINT = "YOUR_EXTERNAL_API_ENDPOINT/playerdata" -- Replace with your API endpoint
+
+-- Anti-Cheat Configuration (Highly Enhanced)
+local MAX_CLICK_RATE = 6
+local MAX_MOVEMENT_SPEED_MULTIPLIER = 1.2
+local MAX_STAT_GAIN_PER_LEVEL = 6
+local MAX_ITEM_ACQUIRE_RATE = 2
+local COMBAT_LOGGING_ENABLED = true
+local EXPLOIT_DETECTION_THRESHOLD = 3
+local CHEATING_PUNISHMENT_DURATION = 30
+
+-- Server-Side Data Structures (Expanded)
+local playerSessions = {}
+local guilds = {}
+local guildIdCounter = 0
+local exploitFlags = {}
+local activeTrades = {}
+
+-- Helper Functions (More Robust)
+local function logServer(message)
+    print("[Server]: " .. message)
+end
+
+local function logCombat(message)
+    if COMBAT_LOGGING_ENABLED then
+        print("[Combat]: " .. message)
+    end
+end
+
+local function isAdmin(player)
+    return table.find(ADMIN_USER_IDS, player.UserId) ~= nil
+end
+
+local function isDeveloper(player)
+    return table.find(DEVELOPER_USER_IDS, player.UserId) ~= nil
+end
+
+local function generateUniqueGuildId()
+    guildIdCounter += 1
+    return guildIdCounter
+end
+
+local function punishCheater(player, reason)
+    local userId = player.UserId
+    exploitFlags[userId] = exploitFlags[userId] or {}
+    exploitFlags[userId][reason] = (exploitFlags[userId][reason] or 0) + 1
+
+    if exploitFlags[userId][reason] >= EXPLOIT_DETECTION_THRESHOLD then
+        warn("Potential cheating detected for player: " .. player.Name .. " - " .. reason .. ". Punishing.")
+        player:Kick("Kicked for suspected cheating: " .. reason .. ". Temporary ban for " .. CHEATING_PUNISHMENT_DURATION .. " seconds.")
+        -- In a scalable environment, you might use a dedicated banning service or database.
+    else
+        warn("Potential cheating detected for player: " .. player.Name .. " - " .. reason .. ". Count: " .. exploitFlags[userId][reason])
+        ReplicatedStorage.ClientEvents.Notification:FireClient(player, "Warning: Suspicious activity detected. Further occurrences may result in punishment.")
+    end
+end
+
+-- Anti-Cheat Functions (Highly Enhanced)
+local function isSpammingClicks(player)
+    local session = playerSessions[player.UserId]
+    if not session then return false end
+    local now = tick()
+    session.ClickHistory = session.ClickHistory or {}
+    table.insert(session.ClickHistory, now)
+    local recentClicks = 0
+    for _, time in ipairs(session.ClickHistory) do
+        if now - time <= 1 then
+            recentClicks += 1
+        end
+    end
+    while #session.ClickHistory > 0 and now - session.ClickHistory[1] > 1 do
+        table.remove(session.ClickHistory, 1)
+    end
+    if recentClicks > MAX_CLICK_RATE then
+        punishCheater(player, "Click Spamming")
+        return true
+    end
+    return false
+end
+
+local function isMovingTooFast(player, newPosition)
+    local session = playerSessions[player.UserId]
+    if not session or not player.Character or not player.Character:FindFirstChild("HumanoidRootPart") then return false end
+    local oldPosition = session.MovementHistory.LastPosition
+    local lastMoveTime = session.MovementHistory.LastMoveTime or 0
+    local now = tick()
+    session.MovementHistory.LastMoveTime = now
+    session.MovementHistory.LastPosition = player.Character.HumanoidRootPart.Position
+
+    if oldPosition and now > lastMoveTime then
+        local distance = (newPosition - oldPosition).Magnitude
+        local timeElapsed = now - lastMoveTime
+        local speed = distance / timeElapsed
+        local expectedSpeed = player.Character.Humanoid.WalkSpeed * MAX_MOVEMENT_SPEED_MULTIPLIER
+        if speed > expectedSpeed * 1.1 then
+            logServer("Potential speed exploit detected for player: " .. player.Name .. " (Speed: " .. speed .. ", Expected: " .. expectedSpeed .. ")")
+            punishCheater(player, "Speed Hacking")
+            return true
+        end
+    end
+    return false
+end
+
+local function validateStatGain(player, proposedStats)
+    local session = playerSessions[player.UserId]
+    if not session then return false end
+    local currentStats = session.Stats or {}
+    local levelDifference = session.Level - (session.LastLevel or STARTING_LEVEL)
+    local totalStatGain = 0
+    for statName, newValue in pairs(proposedStats) do
+        local oldValue = currentStats[statName] or 0
+        totalStatGain += math.max(0, newValue - oldValue)
+    end
+    if levelDifference > 0 and totalStatGain > levelDifference * MAX_STAT_GAIN_PER_LEVEL * 1.2 then
+        warn("Player " .. player.Name .. " attempted to gain too many stats at once (Gain: " .. totalStatGain .. ", Allowed: " .. levelDifference * MAX_STAT_GAIN_PER_LEVEL * 1.2 .. "). Potential exploit.")
+        punishCheater(player, "Stat Manipulation")
+        return false
+    end
+    return true
+end
+
+local function isAcquiringItemsTooFast(player, itemCount)
+    local session = playerSessions[player.UserId]
+    if not session then return false end
+    local now = tick()
+    session.ItemAcquireHistory = session.ItemAcquireHistory or {}
+    table.insert(session.ItemAcquireHistory, { Time = now, Count = itemCount })
+    local recentItems = 0
+    for _, itemData in ipairs(session.ItemAcquireHistory) do
+        if now - itemData.Time <= 1 then
+            recentItems += itemData.Count
+        end
+    end
+    while #session.ItemAcquireHistory > 0 and now - session.ItemAcquireHistory[1].Time > 1 do
+        table.remove(session.ItemAcquireHistory, 1)
+    end
+    if recentItems > MAX_ITEM_ACQUIRE_RATE then
+        warn("Player " .. player.Name .. " is acquiring items too fast (" .. recentItems .. " items in the last second). Potential exploit.")
+        punishCheater(player, "Item Acquisition Exploiting")
+        return true
+    end
+    return false
+end
+
+local function validateInventoryIntegrity(player, inventory)
+    for itemId, count in pairs(inventory) do
+        if count > 1000 then -- Example reasonable limit
+            warn("Player " .. player.Name .. " has an unreasonable quantity of " .. itemId .. ": " .. count)
+            punishCheater(player, "Inventory Manipulation")
+            return false
+        end
+        if not ItemDefinitions[itemId] then
+            warn("Player " .. player.Name .. " has an invalid item in their inventory: " .. itemId)
+            punishCheater(player, "Invalid Inventory Item")
+            return false
+        end
+    end
+    return true
+end
+
+-- Player Data Management (Includes Abilities and Scalability)
+local function loadPlayerData(player)
+    local userId = player.UserId
+    local data
+    local success, err = pcall(function()
+        data = playerDataStore:GetAsync(userId)
+    end)
+
+    if success then
+        if data then
+            playerSessions[userId] = {
+                Level = data.Level or STARTING_LEVEL,
+                Experience = data.Experience or 0,
+                Currency = data.Currency or STARTING_CURRENCY,
+                Inventory = data.Inventory or {},
+                Stats = data.Stats or { Health = 100, Mana = 50, Attack = 10, Defense = 5 },
+                GuildId = data.GuildId,
+                LastActionTime = tick(),
+                ClickHistory = {},
+                MovementHistory = { LastPosition = nil, LastMoveTime = 0 },
+                ItemAcquireHistory = {},
+                Quests = data.Quests or {},
+                LastLevel = data.Level or STARTING_LEVEL,
+                Abilities = data.Abilities or {}
+            }
+            logServer("Loaded data for player: " .. player.Name)
+        else
+            playerSessions[userId] = {
+                Level = STARTING_LEVEL,
+                Experience = 0,
+                Currency = STARTING_CURRENCY,
+                Inventory = {},
+                Stats = { Health = 100, Mana = 50, Attack = 10, Defense = 5 },
+                GuildId = nil,
+                LastActionTime = tick(),
+                ClickHistory = {},
+                MovementHistory = { LastPosition = nil, LastMoveTime = 0 },
+                ItemAcquireHistory = {},
+                Quests = {},
+                LastLevel = STARTING_LEVEL,
+                Abilities = {}
+            }
+            logServer("Created new data for player: " .. player.Name)
+        end
+    else
+        warn("Error loading data for player " .. player.Name .. ": " .. err)
+        playerSessions[userId] = {
+            Level = STARTING_LEVEL,
+            Experience = 0,
+            Currency = STARTING_CURRENCY,
+            Inventory = {},
+            Stats = { Health = 100, Mana = 50, Attack = 10, Defense = 5 },
+            GuildId = nil,
+            LastActionTime = tick(),
+            ClickHistory = {},
+            MovementHistory = { LastPosition = nil, LastMoveTime = 0 },
+            ItemAcquireHistory = {},
+            Quests = {},
+            LastLevel = STARTING_LEVEL,
+            Abilities = {}
+        }
+        ReplicatedStorage.ClientEvents.Notification:FireClient(player, "Error loading your data. A default profile has been loaded.")
+        ReplicatedStorage.ClientEvents.PlayerDataLoaded:FireClient(player, playerSessions[userId])
+    end
+    ReplicatedStorage.ClientEvents.PlayerDataLoaded:FireClient(player, playerSessions[userId])
+end
+
+local function savePlayerDataExternal(player, data)
+    local userId = player.UserId
+    local payload = HttpService:JSONEncode({
+        userId = userId,
+        data = data
+    })
+    local success, err = pcall(function()
+        local response = HttpService:PostAsync(EXTERNAL_API_ENDPOINT .. "/save", payload, nil, Enum.HttpRequestType.Put)
+        if response.StatusCode ~= 200 then
+            warn("Error saving player data to external DB for " .. player.Name .. ": " .. response.StatusMessage)
+        end
+    end)
+    if not success then
+        warn("Error sending save request to external API for " .. player.Name .. ": " .. err)
+        ReplicatedStorage.ClientEvents.Notification:FireClient(player, "Warning: There was an issue saving your progress. Please try again later.")
+    end
+end
+
+local function savePlayerData(player)
+    local userId = player.UserId
+    local session = playerSessions[userId]
+    if session then
+        if not validateStatGain(player, session.Stats) then return end
+        if not validateInventoryIntegrity(player, session.Inventory) then return end
+        local data = {
+            Level = session.Level,
+            Experience = session.Experience,
+            Currency = session.Currency,
+            Inventory = session.Inventory,
+            Stats = session.Stats,
+            GuildId = session.GuildId,
+            Quests = session.Quests,
+            Abilities = session.Abilities
+        }
+        if USE_EXTERNAL_DATABASE then
+            savePlayerDataExternal(player, data)
+        else
+            local success, err = pcall(function()
+                playerDataStore:SetAsync(userId, data)
+            end)
+            if not success then
+                warn("Error saving data for player " .. player.Name .. ": " .. err)
+                ReplicatedStorage.ClientEvents.Notification:FireClient(player, "Warning: There was an issue saving your progress. Please try again later.")
+            else
+                logServer("Saved data for player: " .. player.Name)
+            end
+        end
+    end
+end
+
+-- Guild Data Management (Added Guild Bank)
+local function loadGuildData(guildId)
+    local data
+    local success, err = pcall(function()
+        data = guildDataStore:GetAsync(guildId)
+    end)
+
+    if success then
+        if data then
+            guilds[guildId] = {
+                Name = data.Name,
+                Tag = data.Tag,
+                Members = data.Members or {},
+                Leader = data.Leader,
+                Level = data.Level or 1,
+                Experience = data.Experience or 0,
+                Quests = data.Quests or {},
+                Bank = data.Bank or {}
+            }
+            logServer("Loaded data for guild: " .. data.Name .. " (ID: " .. guildId .. ")")
+        end
+    else
+        warn("Error loading guild data for ID " .. guildId .. ": " .. err)
+        -- Handle guild load failure if necessary
+    end
+end
+
+local function saveGuildData(guildId)
+    local guild = guilds[guildId]
+    if guild then
+        local data = {
+            Name = guild.Name,
+            Tag = guild.Tag,
+            Members = guild.Members,
+            Leader = guild.Leader,
+            Level = guild.Level,
+            Experience = guild.Experience,
+            Quests = guild.Quests,
+            Bank = guild.Bank
+        }
+        local success, err = pcall(function()
+            guildDataStore:SetAsync(guildId, data)
+        end)
+        if not success then
+            warn("Error saving guild data for ID " .. guildId .. ": " .. err)
+            -- Handle guild save failure if necessary
+        else
+            logServer("Saved data for guild: " .. guild.Name .. " (ID: " .. guildId .. "): " .. guildId)
+        end
+    end
+end
+
+-- Guild Functions (Added Guild Bank Management)
+local GUILD_RANKS = {"Member", "Officer", "Leader"}
+local GUILD_PERMISSIONS = {
+    ["Member"] = {},
+    ["Officer"] = {"Invite", "Kick", "DepositBank"},
+    ["Leader"] = {"Invite", "Kick", "Promote", "Demote", "Disband", "ManageQuests", "WithdrawBank"}
+}
+
+local function getGuildRank(guild, userId)
+    for memberId, rank in pairs(guild.Members) do
+        if memberId == userId then
+            return rank
+        end
+    end
+    return nil
+end
+
+local function canPerformGuildAction(guild, userId, action)
+    local rank = getGuildRank(guild, userId)
+    if rank then
+        return table.find(GUILD_PERMISSIONS[rank], action) ~= nil or rank == "Leader"
+    end
+    return false
+end
+
+local function createGuild(player, guildName, guildTag)
+    local userId = player.UserId
+    if playerSessions[userId].GuildId then
+        ReplicatedStorage.ClientEvents.GuildNotification:FireClient(player, "You are already in a guild.")
+        return
+    end
+    if string.len(guildTag) > GUILD_TAG_LENGTH_LIMIT then
+        ReplicatedStorage.ClientEvents.GuildNotification:FireClient(player, "Guild tag is too long.")
+        return
+    end
+    local newGuildId = generateUniqueGuildId()
+    guilds[newGuildId] = {
+        Name = guildName,
+        Tag = guildTag,
+        Members = { [userId] = "Leader" },
+        Leader = userId,
+        Level = 1,
+        Experience = 0,
+        Quests = {},
+        Bank = {}
+    }
+    playerSessions[userId].GuildId = newGuildId
+    saveGuildData(newGuildId)
+    ReplicatedStorage.ClientEvents.GuildNotification:FireClient(player, "Guild '" .. guildName .. "' created!")
+    ReplicatedStorage.ClientEvents.JoinedGuild:FireClient(player, guilds[newGuildId])
+end
+
+local function inviteToGuild(inviter, targetPlayer)
+    local inviterSession = playerSessions[inviter.UserId]
+    local targetSession = playerSessions[targetPlayer.UserId]
+    if not inviterSession.GuildId then
+        ReplicatedStorage.ClientEvents.GuildNotification:FireClient(inviter, "You are not in a guild.")
+        return
+    end
+    if targetSession.GuildId then
+        ReplicatedStorage.ClientEvents.GuildNotification:FireClient(inviter, targetPlayer.Name .. " is already in a guild.")
+        return
+    end
+    local guild = guilds[inviterSession.GuildId]
+    if guild and canPerformGuildAction(guild, inviter.UserId, "Invite") then
+        ReplicatedStorage.ClientEvents.GuildInviteReceived:FireClient(targetPlayer, { GuildId = inviterSession.GuildId, GuildName = guild.Name, InviterName = inviter.Name })
+        ReplicatedStorage.ClientEvents.GuildNotification:FireClient(inviter, "Invite sent to " .. targetPlayer.Name .. ".")
+    else
+        ReplicatedStorage.ClientEvents.GuildNotification:FireClient(inviter, "You do not have permission to invite.")
+    end
+end
+
+local function acceptGuildInvite(player, guildId)
+    local session = playerSessions[player.UserId]
+    if session.GuildId then
+        ReplicatedStorage.ClientEvents.GuildNotification:FireClient(player, "You are already in a guild.")
+        return
+    end
+    local guild = guilds[guildId]
+    if guild then
+        guild.Members[player.UserId] = "Member"
+        session.GuildId = guildId
+        saveGuildData(guildId)
+        ReplicatedStorage.ClientEvents.GuildNotification:FireClient(player, "Joined guild '" .. guild.Name .. "'!")
+        ReplicatedStorage.ClientEvents.JoinedGuild:FireClient(player, guild)
+        -- Notify other guild members (optional)
+    else
+        ReplicatedStorage.ClientEvents.GuildNotification:FireClient(player, "Guild not found.")
+    end
+end
+
+local function leaveGuild(player)
+    local session = playerSessions[player.UserId]
+    local guildId = session.GuildId
+    if not guildId then
+        ReplicatedStorage.ClientEvents.GuildNotification:FireClient(player, "You are not in a guild.")
+        return
+    end
+    local guild = guilds[guildId]
+    if guild then
+        local leavingRank = guild.Members[player.UserId]
+        guild.Members[player.UserId] = nil
+        session.GuildId = nil
+        if guild.Leader == player.UserId and next(guild.Members) then
+            for memberId, rank in pairs(guild.Members) do
+                guild.Leader = memberId
+                guild.Members[memberId] = "Leader"
+                local newLeader = Players:GetPlayerByUserId(memberId)
+                if newLeader then
+                    ReplicatedStorage.ClientEvents.GuildNotification:FireClient(newLeader, "You are the new leader of '" .. guild.Name .. "'.")
+                end
+                break
+            end
+        elseif not next(guild.Members) then
+            guilds[guildId] = nil
+            logServer("Guild '" .. guild.Name .. "' disbanded.")
+        end
+        saveGuildData(guildId)
+        ReplicatedStorage.ClientEvents.GuildNotification:FireClient(player, "You have left the guild.")
+        ReplicatedStorage.ClientEvents.LeftGuild:FireClient(player)
+    end
+end
+
+local function promoteGuildMember(player, targetPlayer)
+    local session = playerSessions[player.UserId]
+    local targetSession = playerSessions[targetPlayer.UserId]
+    if not session.GuildId then return end
+    local guild = guilds[session.GuildId]
+    if guild and guild.Leader == player.UserId and guild.Members[targetPlayer.UserId] and guild.Members[player.UserId] ~= guild.Members[targetPlayer.UserId] then
+        local currentRankIndex = table.find(GUILD_RANKS, guild.Members[targetPlayer.UserId])
+        if currentRankIndex and currentRankIndex < #GUILD_RANKS then
+            guild.Members[targetPlayer.UserId] = GUILD_RANKS[currentRankIndex + 1]
+            saveGuildData(session.GuildId)
+            ReplicatedStorage.ClientEvents.GuildNotification:FireClient(targetPlayer, "You have been promoted to " .. guild.Members[targetPlayer.UserId] .. " in '" .. guild.Name .. "'.")
+            ReplicatedStorage.ClientEvents.GuildNotification:FireClient(player, "Promoted " .. targetPlayer.Name .. " to " .. guild.Members[targetPlayer.UserId] .. ".")
+        else
+            ReplicatedStorage.ClientEvents.GuildNotification:FireClient(player, "Cannot promote further.")
+        end
+    else
+        ReplicatedStorage.ClientEvents.GuildNotification:FireClient(player, "You do not have permission to promote members.")
+    end
+end
+
+local function demoteGuildMember(player, targetPlayer)
+    local session = playerSessions[player.UserId]
+    local targetSession = playerSessions[targetPlayer.UserId]
+    if not session.GuildId then return end
+    local guild = guilds[session.GuildId]
+    if guild and guild.Leader == player.UserId and guild.Members[targetPlayer.UserId] and guild.Members[player.UserId] ~= guild.Members[targetPlayer.UserId] then
+        local currentRankIndex = table.find(GUILD_RANKS, guild.Members[targetPlayer.UserId])
+        if currentRankIndex and currentRankIndex > 1 then
+            guild.Members[targetPlayer.UserId] = GUILD_RANKS[currentRankIndex - 1]
+            saveGuildData(session.GuildId)
+            ReplicatedStorage.ClientEvents.GuildNotification:FireClient(targetPlayer, "You have been demoted to " .. guild.Members[targetPlayer.UserId] .. " in '" .. guild.Name .. "'.")
+            ReplicatedStorage.ClientEvents.GuildNotification:FireClient(player, "Demoted " .. targetPlayer.Name .. " to " .. guild.Members[targetPlayer.UserId] .. ".")
+        else
+            ReplicatedStorage.ClientEvents.GuildNotification:FireClient(player, "Cannot demote further.")
+        end
+    else
+        ReplicatedStorage.ClientEvents.GuildNotification:FireClient(player, "You do not have permission to demote members.")
+    end
+end
+
+local function kickGuildMember(player, targetPlayer)
+    local session = playerSessions[player.UserId]
+    local targetSession = playerSessions[targetPlayer.UserId]
+    if not session.GuildId then return end
+    local guild = guilds[session.GuildId]
+    if guild and canPerformGuildAction(guild, player.UserId, "Kick") and guild.Members[targetPlayer.UserId] and player.UserId ~= targetPlayer.UserId and (guild.Leader == player.UserId or guild.Members[targetPlayer.UserId] ~= "Leader") then
+        guild.Members[targetPlayer.UserId] = nil
+        targetSession.GuildId = nil
+        saveGuildData(session.GuildId)
+        ReplicatedStorage.ClientEvents.GuildNotification:FireClient(targetPlayer, "You have been kicked from '" .. guild.Name .. "'.")
+        ReplicatedStorage.ClientEvents.GuildNotification:FireClient(player, "Kicked " .. targetPlayer.Name .. " from the guild.")
+        ReplicatedStorage.ClientEvents.LeftGuild:FireClient(targetPlayer)
+    else
+        ReplicatedStorage.ClientEvents.GuildNotification:FireClient(player, "You do not have permission to kick this member.")
+    end
+end
+
+local function depositGuildBank(player, amount)
+    local session = playerSessions[player.UserId]
+    local guildId = session.GuildId
+    if not guildId then return end
+    local guild = guilds[guildId]
+    if guild and canPerformGuildAction(guild, player.UserId, "DepositBank") and session.Currency >= amount and amount > 0 then
+        guild.Bank.Currency = (guild.Bank.Currency or 0) + amount
+        session.Currency -= amount
+        saveGuildData(guildId)
+        ReplicatedStorage.ClientEvents.GuildNotification:FireClient(player, "Deposited " .. amount .. " Gold into the guild bank.")
+        ReplicatedStorage.ClientEvents.CurrencyUpdated:FireClient(player, session.Currency, CURRENCY_NAME)
+        -- Notify guild members (optional)
+    else
+        ReplicatedStorage.ClientEvents.GuildNotification:FireClient(player, "You do not have permission or enough currency to deposit.")
+    end
+end
+
+local function withdrawGuildBank(player, amount)
+    local session = playerSessions[player.UserId]
+    local guildId = session.GuildId
+    if not guildId then return end
+    local guild = guilds[guildId]
+    if guild and canPerformGuildAction(guild, player.UserId, "WithdrawBank") and (guild.Bank.Currency or 0) >= amount and amount > 0 then
+        guild.Bank.Currency = (guild.Bank.Currency or 0) - amount
+        session.Currency += amount
+        saveGuildData(guildId)
+        ReplicatedStorage.ClientEvents.GuildNotification:FireClient(player, "Withdrew " .. amount .. " Gold from the guild bank.")
+        ReplicatedStorage.ClientEvents.CurrencyUpdated:FireClient(player, session.Currency, CURRENCY_NAME)
+        -- Notify guild members (optional)
+    else
+        ReplicatedStorage.ClientEvents.GuildNotification:FireClient(player, "You do not have permission or the guild bank doesn't have enough currency to withdraw.")
+    end
+end
+
+-- Experience and Leveling
+local function awardExperience(player, amount)
+    local session = playerSessions[player.UserId]
+    if not session or session.Level >= LEVEL_CAP then return end
+
+    session.Experience += amount * EXPERIENCE_MULTIPLIER
+    local requiredExperience = session.Level * 100 -- Example formula
+    while session.Experience >= requiredExperience and session.Level < LEVEL_CAP do
+        session.Level += 1
+        session.Experience -= requiredExperience
+        requiredExperience = session.Level * 100
+        ReplicatedStorage.ClientEvents.LevelUp:FireClient(player, session.Level)
+    end
+    ReplicatedStorage.ClientEvents.ExperienceUpdated:FireClient(player, session.Experience, requiredExperience)
+end
+
+-- Currency Management
+local function awardCurrency(player, amount)
+    local session = playerSessions[player.UserId]
+    if session then
+        session.Currency += amount
+        ReplicatedStorage.ClientEvents.CurrencyUpdated:FireClient(player, session.Currency, CURRENCY_NAME)
+    end
+end
+
+local function takeCurrency(player, amount)
+    local session = playerSessions[player.UserId]
+    if session and session.Currency >= amount then
+        session.Currency -= amount
+        ReplicatedStorage.ClientEvents.CurrencyUpdated:FireClient(player, session.Currency, CURRENCY_NAME)
+        return true
+    end
+    return false
+end
+
+-- Inventory Management (Server-Side Awarding Example)
+local function awardItemToServer(player, itemId, quantity)
+    local session = playerSessions[player.UserId]
+    if session then
+        if isAcquiringItemsTooFast(player, quantity) then
+            warn("Player " .. player.Name .. " is acquiring items too fast!")
+            return false
+        end
+        session.Inventory[itemId] = (session.Inventory[itemId] or 0) + quantity
+        ReplicatedStorage.ClientEvents.InventoryUpdated:FireClient(player, session.Inventory)
+        return true
+    end
+    return false
+end
+
+local function addItem(player, itemId, quantity)
+    -- In a secure system, you might call awardItemToServer instead of directly manipulating inventory
+    return awardItemToServer(player, itemId, quantity)
+end
+
+local function removeItem(player, itemId, quantity)
+    local session = playerSessions[player.UserId]
+    if session and session.Inventory[itemId] and session.Inventory[itemId] >= quantity then
+        session.Inventory[itemId] -= quantity
+        if session.Inventory[itemId] <= 0 then
+            session.Inventory[itemId] = nil
+        end
+        ReplicatedStorage.ClientEvents.InventoryUpdated:FireClient(player, session.Inventory)
+        return true
+    end
+    return false
+end
+
+local function useItem(player, itemId)
+    local session = playerSessions[player.UserId]
+    if session and session.Inventory[itemId] and session.Inventory[itemId] > 0 then
+        local itemDef = ItemDefinitions[itemId]
+        if itemDef and itemDef.Type == "Consumable" then
+            if itemDef.Effect then
+                itemDef.Effect(player)
+                removeItem(player, itemId, 1)
+            else
+                logServer("Consumable item '" .. itemId .. "' has no effect defined.")
+            end
+        else
+            ReplicatedStorage.ClientEvents.Notification:FireClient(player, "You cannot use that item.")
+        end
+    end
+end
+
+-- More Complex Combat System (Abilities, Damage Types, Armor)
+local ABILITY_DATA = {
+    ["BasicAttack"] = { Name = "Attack", DamageMultiplier = 1, ManaCost = 0, Cooldown = 0.5 },
+    ["HeavyStrike"] = { Name = "Heavy Strike", DamageMultiplier = 1.5, ManaCost = 10, Cooldown = 2 },
+    ["Heal"] = { Name = "Heal", HealAmount = 30, ManaCost = 15, Cooldown = 3 },
+    -- Add more abilities
+}
+
+local function calculateDamage(attackerStats, defenderStats, abilityData)
+    local baseDamage = attackerStats.Attack * abilityData.DamageMultiplier
+    local defense = defenderStats.Defense or 0
+    local damageAfterDefense = math.max(0, baseDamage - defense)
+    return damageAfterDefense
+end
+
+local function applyHeal(targetSession, amount)
+    targetSession.Stats.Health = math.min((targetSession.Stats.Health or 100) + amount, 100)
+    ReplicatedStorage.ClientEvents.UpdateHealth:FireClient(Players:GetPlayerByUserId(targetSession.UserId), targetSession.Stats.Health)
+end
+
+local function dealDamage(attacker, target, amount)
+    local targetSession = playerSessions[target.UserId]
+    if targetSession then
+        targetSession.Stats.Health = (targetSession.Stats.Health or 100) - amount
+        logCombat(attacker.Name .. " dealt " .. amount .. " damage to " .. target.Name .. ". New health: " .. (targetSession.Stats.Health or 0))
+        ReplicatedStorage.ClientEvents.UpdateHealth:FireClient(target, targetSession.Stats.Health or 0)
+        if (targetSession.Stats.Health or 0) <= 0 then
+            handleDeath(target, attacker)
+        end
+    end
+end
+
+local function handleDeath(player, killer)
+    logCombat(player.Name .. " has been defeated by " .. killer.Name .. ".")
+    awardExperience(killer, 50)
+    awardCurrency(killer, 25)
+    ReplicatedStorage.ClientEvents.PlayerDied:FireClient(player)
+    ReplicatedStorage.ClientEvents.Notification:FireClient(killer, "You defeated " .. player.Name .. "!")
+end
+
+ReplicatedStorage.ServerEvents.UseAbilityRequest.OnServerEvent:Connect(function(player, abilityId, targetName)
+    if isSpammingClicks(player) then return end
+    local session = playerSessions[player.UserId]
+    local abilityInfo = ABILITY_DATA[abilityId]
+    local targetPlayer = Players:FindFirstChild(targetName)
+
+    if session and abilityInfo then
+        if (session.Stats.Mana or 0) >= abilityInfo.ManaCost then
+            local currentTime = tick()
+            session.AbilityCooldowns = session.AbilityCooldowns or {}
+            if not session.AbilityCooldowns[abilityId] or currentTime - session.AbilityCooldowns[abilityId] >= abilityInfo.Cooldown then
+                session.Stats.Mana -= abilityInfo.ManaCost
+                ReplicatedStorage.ClientEvents.UpdateMana:FireClient(player, session.Stats.Mana)
+                session.AbilityCooldowns[abilityId] = currentTime
+
+                if abilityId == "BasicAttack" and targetPlayer and targetPlayer ~= player and targetPlayer.Character and (targetPlayer.Character.HumanoidRootPart.Position - player.Character.HumanoidRootPart.Position).Magnitude < 10 then
+                    local damage = calculateDamage(session.Stats, playerSessions[targetPlayer.UserId].Stats, abilityInfo)
+                    dealDamage(player, targetPlayer, damage)
+                elseif abilityId == "HeavyStrike" and targetPlayer and targetPlayer ~= player and targetPlayer.Character and (targetPlayer.Character.HumanoidRootPart.Position - player.Character.HumanoidRootPart.Position).Magnitude < 10 then
+                    local damage = calculateDamage(session.Stats, playerSessions[targetPlayer.UserId].Stats, abilityInfo)
+                    dealDamage(player, targetPlayer, damage)
+                elseif abilityId == "Heal" then
+                    applyHeal(session, abilityInfo.HealAmount)
+                -- Add logic for other abilities
+                end
+            else
+                ReplicatedStorage.ClientEvents.Notification:FireClient(player, "Ability '" .. abilityInfo.Name .. "' is on cooldown.")
+            end
+        else
+            ReplicatedStorage.ClientEvents.Notification:FireClient(player, "Not enough Mana to use '" .. abilityInfo.Name .. "'.")
+        end
+    end
+end)
+
+-- More Detailed Quest System
+local function startQuest(player, questId)
+    local session = playerSessions[player.UserId]
+    if session and QuestDefinitions[questId] and not session.Quests[questId] then
+        session.Quests[questId] = "Active"
+        session.QuestProgress = session.QuestProgress or {}
+        session.QuestProgress[questId] = {} -- Initialize progress
+        savePlayerData(player)
+        ReplicatedStorage.ClientEvents.QuestStarted:FireClient(player, questId, QuestDefinitions[questId])
+        ReplicatedStorage.ClientEvents.Notification:FireClient(player, "Quest '" .. QuestDefinitions[questId].Name .. "' started!")
+    end
+end
+
+local function completeQuestObjective(player, questId, objectiveType, objectiveData)
+    local session = playerSessions[player.UserId]
+    local questDef = QuestDefinitions[questId]
+    if session and session.Quests[questId] == "Active" and questDef then
+        local objectivesCompleted = session.QuestProgress and session.QuestProgress[questId] or {}
+        local objectiveIndex = objectiveData.Index
+
+        if objectiveType == "TalkToNPC" and objectiveData.NPCName and objectiveData.PlayerName == player.Name then
+            if objectiveData.NPCName == questDef.Objectives[objectiveIndex].TargetNPC then
+                objectivesCompleted[objectiveIndex] = true
+            end
+        elseif objectiveType == "KillMonsters" and objectiveData.MonsterType then
+            session.QuestProgress[questId][objectiveIndex] = (session.QuestProgress[questId][objectiveIndex] or 0) + 1
+            ReplicatedStorage.ClientEvents.QuestObjectiveUpdated:FireClient(player, questId, objectiveIndex, session.QuestProgress[questId][objectiveIndex], questDef.Objectives[objectiveIndex].Count)
+            if session.QuestProgress[questId][objectiveIndex] >= questDef.Objectives[objectiveIndex].Count then
+                objectivesCompleted[objectiveIndex] = true
+            end
+        elseif objectiveType == "CollectItem" and objectiveData.ItemId then
+            if session.Inventory[objectiveData.ItemId] >= questDef.Objectives[objectiveIndex].Count then
+                objectivesCompleted[objectiveIndex] = true
+            end
+        elseif objectiveType == "ReachLocation" and objectiveData.LocationTag then
+            -- Implement proximity check if needed
+            if objectiveData.LocationTag == questDef.Objectives[objectiveIndex].Location then
+                objectivesCompleted[objectiveIndex] = true
+            end
+        end
+
+        local allObjectivesCompleted = true
+        for i = 1, #questDef.Objectives do
+            if not objectivesCompleted[i] then
+                allObjectivesCompleted = false
+                break
+            end
+        end
+
+        if allObjectivesCompleted then
+            session.Quests[questId] = "Completed"
+            awardExperience(player, questDef.Rewards.Experience or 0)
+            awardCurrency(player, questDef.Rewards.Gold or 0)
+            if questDef.Rewards.Item then
+                addItem(player, questDef.Rewards.Item, 1)
+            end
+            session.QuestProgress[questId] = nil
+            savePlayerData(player)
+            ReplicatedStorage.ClientEvents.QuestCompleted:FireClient(player, questId)
+            ReplicatedStorage.ClientEvents.Notification:FireClient(player, "Quest '" .. questDef.Name .. "' completed!")
+        else
+            session.QuestProgress[questId] = objectivesCompleted
+            savePlayerData(player)
+        end
+    end
+end
+
+ReplicatedStorage.ServerEvents.StartQuestRequest.OnServerEvent:Connect(startQuest)
+ReplicatedStorage.ServerEvents.CompleteQuestObjectiveRequest.OnServerEvent:Connect(completeQuestObjective)
+ReplicatedStorage.ServerEvents.UseItemRequest.OnServerEvent:Connect(useItem)
+
+-- Basic Crafting System
+ReplicatedStorage.ServerEvents.CraftItemRequest.OnServerEvent:Connect(function(player, recipeId)
+    local session = playerSessions[player.UserId]
+    local craftingRecipes = require(ReplicatedStorage.SharedModules:WaitForChild("CraftingRecipes"))
+    local recipe = craftingRecipes[recipeId]
+
+    if session and recipe then
+        local canCraft = true
+        for itemId, requiredAmount in pairs(recipe.Ingredients) do
+            if not session.Inventory[itemId] or session.Inventory[itemId] < requiredAmount then
+                canCraft = false
+                ReplicatedStorage.ClientEvents.Notification:FireClient(player, "You do not have enough " .. ItemDefinitions[itemId].Name .. " to craft " .. ItemDefinitions[recipe.Result].Name .. ".")
+                break
+            end
+        end
+
+        if canCraft then
+            local character = player.Character
+            if not character then return end
+            local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+            local nearStation = false
+            for _, part in pairs(game.Workspace:GetDescendants()) do
+                if part:IsA("BasePart") and part:GetTag(CRAFTING_STATION_TAG) then
+                    if humanoidRootPart and (part.Position - humanoidRootPart.Position).Magnitude < 10 then
+                        nearStation = true
+                        break
+                    end
+                end
+            end
+            if recipe.RequiresStation and not nearStation then
+                ReplicatedStorage.ClientEvents.Notification:FireClient(player, "You need to be near a crafting station to craft this.")
+                return
+            end
+
+            for itemId, requiredAmount in pairs(recipe.Ingredients) do
+                removeItem(player, itemId, requiredAmount)
+            end
+            addItem(player, recipe.Result, 1)
+            ReplicatedStorage.ClientEvents.Notification:FireClient(player, "Crafted " .. ItemDefinitions[recipe.Result].Name .. ".")
+        end
+    end
+end)
+
+-- Basic Trading System
+ReplicatedStorage.ServerEvents.RequestTrade.OnServerEvent:Connect(function(player, targetName)
+    local targetPlayer = Players:FindFirstChild(targetName)
+    if targetPlayer and targetPlayer ~= player then
+        local playerSession = playerSessions[player.UserId]
+        local targetSession = playerSessions[targetPlayer.UserId]
+        if playerSession and targetSession then
+            if activeTrades[player.UserId] or activeTrades[targetPlayer.UserId] then
+                ReplicatedStorage.ClientEvents.Notification:FireClient(player, "That player is already in a trade.")
+                return
+            end
+            local character1 = player.Character
+            local character2 = targetPlayer.Character
+            if character1 and character2 and character1:FindFirstChild("HumanoidRootPart") and character2:FindFirstChild("HumanoidRootPart") then
+                local distance = (character1.HumanoidRootPart.Position - character2.HumanoidRootPart.Position).Magnitude <= TRADING_DISTANCE
+                if distance then
+                    activeTrades[player.UserId] = targetPlayer.UserId
+                    activeTrades[targetPlayer.UserId] = player.UserId
+                    ReplicatedStorage.ClientEvents.TradeRequestReceived:FireClient(targetPlayer, player.Name)
+                    ReplicatedStorage.ClientEvents.Notification:FireClient(player, "Trade request sent to " .. targetName .. ".")
+                else
+                    ReplicatedStorage.ClientEvents.Notification:FireClient(player, targetName .. " is too far away to trade.")
+                end
+            end
+        end
+    end
+end)
+
+ReplicatedStorage.ServerEvents.AcceptTrade.OnServerEvent:Connect(function(player, otherPlayerName)
+    local otherPlayer = Players:FindFirstChild(otherPlayerName)
+    if otherPlayer and activeTrades[player.UserId] == otherPlayer.UserId then
+        ReplicatedStorage.ClientEvents.StartTrade:FireClient(player, otherPlayerName)
+        ReplicatedStorage.ClientEvents.StartTrade:FireClient(otherPlayer, player.Name)
+        -- Implement trade UI and item offering logic
+    else
+        ReplicatedStorage.ClientEvents.Notification:FireClient(player, "Trade request no longer active or invalid player.")
+    end
+end)
+
+ReplicatedStorage.ServerEvents.OfferTradeItems.OnServerEvent:Connect(function(player, offeredItems)
+    -- Validate offered items and store them
+end)
+
+ReplicatedStorage.ServerEvents.ConfirmTrade.OnServerEvent:Connect(function(player, otherPlayerName)
+    local otherPlayer = Players:FindFirstChild(otherPlayerName)
+    if otherPlayer and activeTrades[player.UserId] == otherPlayer.UserId then
+        -- Implement item exchange logic
+        activeTrades[player.UserId] = nil
+        activeTrades[otherPlayer.UserId] = nil
+        ReplicatedStorage.ClientEvents.Notification:FireClient(player, "Trade successful.")
+        ReplicatedStorage.ClientEvents.Notification:FireClient(otherPlayer, "Trade successful.")
+    end
+end)
+
+ReplicatedStorage.ServerEvents.CancelTrade.OnServerEvent:Connect(function(player, otherPlayerName)
+    local otherPlayer = Players:FindFirstChild(otherPlayerName)
+    if otherPlayer and activeTrades[player.UserId] == otherPlayer.UserId then
+        activeTrades[player.UserId] = nil
+        activeTrades[otherPlayer.UserId] = nil
+        ReplicatedStorage.ClientEvents.Notification:FireClient(player, "Trade cancelled.")
+        ReplicatedStorage.ClientEvents.Notification:FireClient(otherPlayer, "Trade cancelled.")
+    end
+end)
+
+ReplicatedStorage.ServerEvents.HealRequest.OnServerEvent:Connect(function(player, targetName, amount)
+    if player.Name == targetName then
+        local session = playerSessions[player.UserId]
+        if session then
+            session.Stats.Health = math.min((session.Stats.Health or 100) + amount, 100)
+            ReplicatedStorage.ClientEvents.UpdateHealth:FireClient(player, session.Stats.Health)
+        end
+    end
+end)
+
+ReplicatedStorage.ServerEvents.UpdateManaRequest.OnServerEvent:Connect(function(player, amount)
+    local session = playerSessions[player.UserId]
+    if session then
+        session.Stats.Mana = math.min((session.Stats.Mana or 50) + amount, 50)
+        ReplicatedStorage.ClientEvents.UpdateMana:FireClient(player, session.Stats.Mana)
+    end
+end)
+
+-- Server-Side Stat Increase Validation
+ReplicatedStorage.ServerEvents.IncreaseStatRequest.OnServerEvent:Connect(function(player, statName)
+    local session = playerSessions[player.UserId]
+    if session then
+        local currentLevel = session.Level
+        local stats = session.Stats
+        local statPointsSpent = 0
+        for _, value in pairs(stats) do
+            statPointsSpent += value - 10 -- Assuming base stats start at 10
+        end
+        local availableStatPoints = (currentLevel - STARTING_LEVEL) * 5 - statPointsSpent -- Example: 5 stat points per level
+
+        if availableStatPoints > 0 then
+            if stats[statName] then
+                stats[statName] += 1
+                savePlayerData(player)
+                ReplicatedStorage.ClientEvents.PlayerDataLoaded:FireClient(player, session)
+                ReplicatedStorage.ClientEvents.Notification:FireClient(player, statName .. " increased!")
+            else
+                ReplicatedStorage.ClientEvents.Notification:FireClient(player, "Invalid stat name.")
+            end
+        else
+            ReplicatedStorage.ClientEvents.Notification:FireClient(player, "Not enough stat points to increase " .. statName .. ".")
+        end
+    end
+end)
+
+-- Admin Commands (Even More Extensive)
+ReplicatedStorage.ServerEvents.AdminCommand.OnServerEvent:Connect(function(player, command, ...)
+    if isAdmin(player) then
+        local args = {...}
+        if command == "giveexp" then
+            local targetName = args[1]
+            local amount = tonumber(args[2])
+            local target = Players:FindFirstChild(targetName)
+            if target and amount then
+                awardExperience(target, amount)
+                ReplicatedStorage.ClientEvents.AdminNotification:FireClient(player, "Gave " .. amount .. " experience to " .. targetName .. ".")
+            else
+                ReplicatedStorage.ClientEvents.AdminNotification:FireClient(player, "Usage: /giveexp [player] [amount]")
+            end
+        elseif command == "givegold" then
+            local targetName = args[1]
+            local amount = tonumber(args[2])
+            local target = Players:FindFirstChild(targetName)
+            if target and amount then
+                awardCurrency(target, amount)
+                ReplicatedStorage.ClientEvents.AdminNotification:FireClient(player, "Gave " .. amount .. " gold to " .. targetName .. ".")
+            else
+                ReplicatedStorage.ClientEvents.AdminNotification:FireClient(player, "Usage: /givegold [player] [amount]")
+            end
+        elseif command == "setlevel" then
+            local targetName = args[1]
+            local level = tonumber(args[2])
+            local target = Players:FindFirstChild(targetName)
+            if target and level and level >= 1 and level <= LEVEL_CAP then
+                playerSessions[target.UserId].Level = level
+                savePlayerData(target)
+                ReplicatedStorage.ClientEvents.LevelUp:FireClient(target, level)
+                ReplicatedStorage.ClientEvents.AdminNotification:FireClient(player, "Set level of " .. targetName .. " to " .. level .. ".")
+            else
+                ReplicatedStorage.ClientEvents.AdminNotification:FireClient(player, "Usage: /setlevel [player] [level]")
+            end
+        elseif command == "kick" then
+            local targetName = args[1]
+            local reason = table.concat(args, " ", 2) or "Kicked by admin."
+            local target = Players:FindFirstChild(targetName)
+            if target then
+                target:Kick(reason)
+                ReplicatedStorage.ClientEvents.AdminNotification:FireClient(player, "Kicked player " .. targetName .. ".")
+            else
+                ReplicatedStorage.ClientEvents.AdminNotification:FireClient(player, "Player " .. targetName .. " not found.")
+            end
+        elseif command == "ban" then
+            local targetName = args[1]
+            local reason = table.concat(args, " ", 2) or "Banned by admin."
+            local target = Players:FindFirstChild(targetName)
+            if target then
+                -- Implement more robust banning (e.g., store in a DataStore with expiry)
+                target:Kick(reason)
+                ReplicatedStorage.ClientEvents.AdminNotification:FireClient(player, "Banned player " .. targetName .. ".")
+            else
+                ReplicatedStorage.ClientEvents.AdminNotification:FireClient(player, "Player " .. targetName .. " not found.")
+            end
+        elseif command == "spawnitem" then
+            local itemName = args[1]
+            local targetName = args[2] or player.Name
+            local targetPlayer = Players:FindFirstChild(targetName)
+            if targetPlayer and ItemDefinitions[itemName] then
+                addItem(targetPlayer, itemName, 1)
+                ReplicatedStorage.ClientEvents.AdminNotification:FireClient(player, "Spawned item '" .. itemName .. "' for " .. targetName .. ".")
+            else
+                ReplicatedStorage.ClientEvents.AdminNotification:FireClient(player, "Usage: /spawnitem [item name] [player (optional)]")
+            end
+        elseif command == "mute" then
+            local targetName = args[1]
+            local duration = tonumber(args[2]) or 60
+            local target = Players:FindFirstChild(targetName)
+            if target then
+                -- Implement muting logic (e.g., set a MutedUntil timestamp in playerSession)
+                ReplicatedStorage.ClientEvents.AdminNotification:FireClient(player, "Muted " .. targetName .. " for " .. duration .. " seconds.")
+                ReplicatedStorage.ClientEvents.Notification:FireClient(target, "You have been muted by an admin for " .. duration .. " seconds.")
+            else
+                ReplicatedStorage.ClientEvents.AdminNotification:FireClient(player, "Player " .. targetName .. " not found.")
+            end
+        elseif command == "unmute" then
+            local targetName = args[1]
+            local target = Players:FindFirstChild(targetName)
+            if target then
+                -- Implement unmuting logic
+                ReplicatedStorage.ClientEvents.AdminNotification:FireClient(player, "Unmuted " .. targetName .. ".")
+                ReplicatedStorage.ClientEvents.Notification:FireClient(target, "You have been unmuted by an admin.")
+            else
+                ReplicatedStorage.ClientEvents.AdminNotification:FireClient(player, "Player " .. targetName .. " not found.")
+            end
+        elseif command == "teleport" then
+            local targetName1 = args[1]
+            local targetName2 = args[2]
+            local player1 = Players:FindFirstChild(targetName1)
+            local player2 = Players:FindFirstChild(targetName2)
+            if player1 and player2 and player1.Character and player2.Character and player2.Character:FindFirstChild("HumanoidRootPart") then
+                player1.Character:MoveTo(player2.Character.HumanoidRootPart.Position + Vector3.new(0, 2, 0))
+                ReplicatedStorage.ClientEvents.AdminNotification:FireClient(player, "Teleported " .. targetName1 .. " to " .. targetName2 .. ".")
+            else
+                ReplicatedStorage.ClientEvents.AdminNotification:FireClient(player, "Usage: /teleport [player1] [player2]")
+            end
+        -- Add more admin commands
+        else
+            ReplicatedStorage.ClientEvents.AdminNotification:FireClient(player, "Unknown admin command.")
+        end
+    else
+        ReplicatedStorage.ClientEvents.Notification:FireClient(player, "You do not have permission to use admin commands.")
+    end
+end)
+
+-- Developer Commands (More Extensive)
+ReplicatedStorage.ServerEvents.DeveloperCommand.OnServerEvent:Connect(function(player, command, ...)
+    if isDeveloper(player) then
+        local args = {...}
+        if command == "reloadquests" then
+            local success, newQuestDefs = pcall(function()
+                return require(ReplicatedStorage.SharedModules:WaitForChild("QuestDefinitions"))
+            end)
+            if success then
+                QuestDefinitions = newQuestDefs
+                ReplicatedStorage.ClientEvents.DeveloperNotification:FireClient(player, "Quest definitions reloaded.")
+            else
+                ReplicatedStorage.ClientEvents.DeveloperNotification:FireClient(player, "Error reloading quest definitions: " .. newQuestDefs)
+            end
+        elseif command == "giveitem" then
+            local itemName = args[1]
+            local targetName = args[2] or player.Name
+            local targetPlayer = Players:FindFirstChild(targetName)
+            if targetPlayer and ItemDefinitions[itemName] then
+                awardItemToServer(targetPlayer, itemName, 1)
+                ReplicatedStorage.ClientEvents.DeveloperNotification:FireClient(player, "Gave item '" .. itemName .. "' to " .. targetName .. ".")
+            else
+                ReplicatedStorage.ClientEvents.DeveloperNotification:FireClient(player, "Usage: /giveitem [item name] [player (optional)]")
+            end
+        elseif command == "setstat" then
+            local targetName = args[1] or player.Name
+            local statName = args[2]
+            local statValue = tonumber(args[3])
+            local targetPlayer = Players:FindFirstChild(targetName)
+            if targetPlayer and playerSessions[targetPlayer.UserId] and statName and statValue then
+                playerSessions[targetPlayer.UserId].Stats[statName] = statValue
+                savePlayerData(targetPlayer)
+                ReplicatedStorage.ClientEvents.DeveloperNotification:FireClient(player, "Set stat '" .. statName .. "' of " .. targetName .. " to " .. statValue .. ".")
+                ReplicatedStorage.ClientEvents.PlayerDataLoaded:FireClient(targetPlayer, playerSessions[targetPlayer.UserId])
+            else
+                ReplicatedStorage.ClientEvents.DeveloperNotification:FireClient(player, "Usage: /setstat [player (optional)] [stat name] [value]")
+            end
+        -- Add more developer commands
+        else
+            ReplicatedStorage.ClientEvents.DeveloperNotification:FireClient(player, "Unknown developer command.")
+        end
+    else
+        ReplicatedStorage.ClientEvents.Notification:FireClient(player, "You do not have permission to use developer commands.")
+    end
+end)
+
+-- Anti-Cheat Monitoring
+Players.PlayerAdded:Connect(function(player)
+    player.CharacterAdded:Connect(function(character)
+        local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+        humanoidRootPart:GetPropertyChangedSignal("Position"):Connect(function()
+            if playerSessions[player.UserId] then
+                isMovingTooFast(player, humanoidRootPart.Position)
+            end
+        end)
+
+        local humanoid = character:WaitForChild("Humanoid")
+        humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+            if playerSessions[player.UserId] and humanoid.WalkSpeed > 16 * MAX_MOVEMENT_SPEED_MULTIPLIER then
+                warn("Potential walk speed exploit detected for player: " .. player.Name .. " (Speed: " .. humanoid.WalkSpeed .. ")")
+                punishCheater(player, "Walk Speed Hacking")
+            end
+        end)
+
+        character:DescendantAdded:Connect(function(descendant)
+            if descendant:IsA("Script") and descendant.Parent == character then
+                warn("Unauthorized script detected in player's character (DescendantAdded): " .. player.Name .. " - " .. descendant.Name)
+                punishCheater(player, "Unauthorized Script")
+                descendant:Destroy()
+            elseif descendant:IsA("LocalScript") and descendant.Parent == character then
+                warn("Unauthorized local script detected in player's character: " .. player.Name .. " - " .. descendant.Name)
+                punishCheater(player, "Unauthorized Local Script")
+                descendant:Destroy()
+            end
+        end)
+    end)
+
+    player.Changed:Connect(function(propertyName)
+        if propertyName == "Character" and player.Character then
+            local character = player.Character
+            local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+            humanoidRootPart:GetPropertyChangedSignal("Position"):Connect(function()
+                if playerSessions[player.UserId] then
+                    isMovingTooFast(player, humanoidRootPart.Position)
+                end
+            end)
+
+            local humanoid = character:WaitForChild("Humanoid")
+            humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+                if playerSessions[player.UserId] and humanoid.WalkSpeed > 16 * MAX_MOVEMENT_SPEED_MULTIPLIER then
+                    warn("Potential walk speed exploit detected (Character Changed): " .. player.Name .. " (Speed: " .. humanoid.WalkSpeed .. ")")
+                    punishCheater(player, "Walk Speed Hacking")
+                end
+            end)
+        end
+    end)
+end)
+
+-- Periodic Data Saving
+task.spawn(function()
+    while true do
+        wait(300)
+        for _, player in pairs(Players:GetPlayers()) do -- Scalability Note: Consider saving only active players or using a different saving mechanism.
+            savePlayerData(player)
+        end
+        wait(600)
+        for guildId, _ in pairs(guilds) do -- Scalability Note: If the number of guilds grows very large, consider saving only active guilds or using a more efficient storage strategy.
+            saveGuildData(guildId)
+        end
+    end
+end)
+
+logServer("Server Game Manager Initialized")
+
+-----------------------------------------------------------------------------------
+-- //////////////////////// CLIENT-SIDE SCRIPTS ////////////////////////
+-----------------------------------------------------------------------------------
+
+--// StarterPlayerScripts: ClientGameManager (LocalScript) //--
+-- **IMPORTANT:** You need to include the ClientGameManager LocalScript from our previous turn here. This script handles client-side logic, UI updates, and communication with the server.
+
+-----------------------------------------------------------------------------------
+-- //////////////////////// MODULE SCRIPTS (Examples) ////////////////////////
+-----------------------------------------------------------------------------------
+
+--// ReplicatedStorage.SharedModules: ItemDefinitions //--
+-- **IMPORTANT:** You need to include the ItemDefinitions ModuleScript from our previous turn here. This module defines all the items in your game.
+
+--// ReplicatedStorage.SharedModules: QuestDefinitions //--
+-- **IMPORTANT:** You need to include the QuestDefinitions ModuleScript from our previous turn here. This module defines all the quests in your game.
+
+--// ReplicatedStorage.SharedModules: CraftingRecipes //--
+-- **IMPORTANT:** You need to include the CraftingRecipes ModuleScript from our previous turn here. This module defines all the crafting recipes in your game.
