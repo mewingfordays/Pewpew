@@ -1,0 +1,164 @@
+local Players = game:GetService("Players")
+local DataStoreService = game:GetService("DataStoreService")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+
+local BanDataStore = DataStoreService:GetDataStore("BannedPlayers")
+local CoinDataStore = DataStoreService:GetDataStore("PlayerCoins")
+local BanCountStore = DataStoreService:GetDataStore("BanCounts")
+
+local Admins = { "moneygreenshadow" } -- Add more admin usernames here
+local WEBHOOK_URL = "YOUR_DISCORD_WEBHOOK_HERE" -- Replace with your webhook URL
+
+-- Function to check if a player is an admin
+local function isAdmin(player)
+    for _, adminName in ipairs(Admins) do
+        if player.Name == adminName then
+            return true
+        end
+    end
+    return false
+end
+
+-- Function to send log to Discord
+local function sendLogToDiscord(message)
+    local data = { ["content"] = message }
+    HttpService:PostAsync(WEBHOOK_URL, HttpService:JSONEncode(data), Enum.HttpContentType.ApplicationJson)
+end
+
+-- Ban player function
+local function banPlayer(player, reason)
+    local userId = player.UserId
+    local banEndTime = os.time() + (3 * 24 * 60 * 60) -- 3 days ban
+
+    -- Get previous ban count
+    local banCount = BanCountStore:GetAsync(userId) or 0
+    banCount = banCount + 1 -- Increment ban count
+    BanCountStore:SetAsync(userId, banCount)
+
+    -- If player has been banned 3 times, permaban them
+    if banCount >= 3 then
+        banEndTime = math.huge -- Permanent ban
+    end
+
+    BanDataStore:SetAsync(userId, banEndTime)
+    sendLogToDiscord(":rotating_light: **" .. player.Name .. "** was banned for **" .. reason .. "** (Ban Count: " .. banCount .. ")")
+    player:Kick("You have been banned for 3 days. Reason: " .. reason)
+end
+
+-- Check if a player is banned on join
+Players.PlayerAdded:Connect(function(player)
+    local userId = player.UserId
+    local banTime = BanDataStore:GetAsync(userId)
+
+    if banTime and os.time() < banTime then
+        player:Kick("You are banned until: " .. os.date("%Y-%m-%d %H:%M:%S", banTime))
+    end
+end)
+
+-- Function to give admins money via chat command
+local function giveAdminCoins(player, amount)
+    if isAdmin(player) then
+        local leaderstats = player:FindFirstChild("leaderstats")
+        if leaderstats then
+            local coins = leaderstats:FindFirstChild("Coins")
+            if coins then
+                coins.Value = coins.Value + amount
+                CoinDataStore:SetAsync(player.UserId, coins.Value) -- Save new balance
+
+                -- Log action to Discord
+                sendLogToDiscord(":moneybag: **" .. player.Name .. "** gave themselves **" .. amount .. "** coins.")
+            end
+        end
+    else
+        player:Kick("Attempted to use admin commands without permission.")
+    end
+end
+
+-- Function to handle player join
+local function onPlayerJoin(player)
+    if isAdmin(player) then
+        print(player.Name .. " is an admin, skipping anti-cheat.")
+    else
+        print("[SYSTEM] Monitoring " .. player.Name .. " for exploits...")
+    end
+
+    -- Leaderstats Setup
+    local leaderstats = Instance.new("Folder")
+    leaderstats.Name = "leaderstats"
+    leaderstats.Parent = player
+
+    local coins = Instance.new("IntValue")
+    coins.Name = "Coins"
+    coins.Parent = leaderstats
+
+    -- Load saved coins
+    local savedCoins = CoinDataStore:GetAsync(player.UserId)
+    if savedCoins then
+        coins.Value = savedCoins
+    else
+        coins.Value = 0
+    end
+
+    local lastCoinTime = os.time()
+    local lastPosition = nil
+
+    -- Coin System & Anti-Cheat
+    while player and player.Parent do
+        wait(1)
+
+        if isAdmin(player) then
+            coins.Value = coins.Value + 1 -- Admins bypass checks
+        else
+            local currentTime = os.time()
+            local timeDiff = currentTime - lastCoinTime
+
+            -- Check if player is gaining too many coins per second
+            if timeDiff >= 1 and timeDiff <= 2 then
+                coins.Value = coins.Value + 1
+                CoinDataStore:SetAsync(player.UserId, coins.Value) -- Save coins
+            elseif timeDiff < 1 then
+                banPlayer(player, "Coin Exploit Detected")
+                return
+            end
+
+            lastCoinTime = currentTime
+
+            -- Speed & Teleport Detection
+            local character = player.Character
+            if character and character:FindFirstChild("HumanoidRootPart") then
+                local root = character.HumanoidRootPart
+
+                if lastPosition then
+                    local distance = (root.Position - lastPosition).magnitude
+                    if distance > 50 then -- Detects teleporting or extreme speed
+                        banPlayer(player, "Teleport/Speed Hack Detected")
+                        return
+                    elseif root.Velocity.Y > 50 then -- Detects flying
+                        player:Kick("Flying Detected. Kicked for exploiting.")
+                        return
+                    end
+                end
+                lastPosition = root.Position
+            end
+        end
+    end
+end
+
+-- Chat command listener for admins
+Players.PlayerAdded:Connect(function(player)
+    player.Chatted:Connect(function(message)
+        if string.sub(message, 1, 11) == "/givemoney=" then
+            local amount = tonumber(string.sub(message, 12)) -- Extract number after "="
+
+            if amount and amount > 0 and amount <= 1000000000 then
+                giveAdminCoins(player, amount)
+            else
+                player:Kick("Invalid amount entered in /givemoney command. Must be between 1 and 1,000,000,000.")
+            end
+        end
+    end)
+end)
+
+-- Connect to Player Events
+Players.PlayerAdded:Connect(onPlayerJoin)
